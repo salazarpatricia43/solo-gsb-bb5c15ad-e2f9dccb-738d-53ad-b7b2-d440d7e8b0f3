@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app import exports as export_mod
+from app import db as db_mod
 
 
 @pytest.fixture()
@@ -321,3 +322,128 @@ def test_invalid_range_and_page_size(client):
         "/api/v1/exports", json={"device_id": "exp-i", "page_size": 1001}
     )
     assert r.status_code == 422
+
+
+class _StaticCursor:
+    """把预取的行伪装成仅支持 fetchall 的游标（用于批计数代理连接）。"""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+
+class _BatchCountingConn:
+    """委托真实连接，仅对 committed 分批 SELECT 预取并记录每批行数。"""
+
+    def __init__(self, conn, batch_sizes):
+        self._conn = conn
+        self._batch_sizes = batch_sizes
+
+    def execute(self, sql, params=()):
+        if " FROM committed " in sql and " LIMIT ?" in sql:
+            rows = self._conn.execute(sql, params).fetchall()
+            self._batch_sizes.append(len(rows))
+            return _StaticCursor(rows)
+        return self._conn.execute(sql, params)
+
+    def executemany(self, sql, params):
+        return self._conn.executemany(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_snapshot_streamed_in_seq_batches_unbounded(client, monkeypatch):
+    """无界范围跨多批 keyset 流式复制：结果与一次性装载完全一致。"""
+    monkeypatch.setattr(export_mod, "SNAPSHOT_BATCH_SIZE", 10)
+    ingest_range(client, "exp-batch", 1, 23)
+
+    batch_sizes = []
+    with db_mod.ingest_lock, db_mod.get_conn() as conn:
+        task = export_mod.create_export(
+            _BatchCountingConn(conn, batch_sizes), "exp-batch", None, None
+        )
+    eid = task.export_id
+
+    # 23 行按批大小 10 推进：两批满批 + 一批短批，绝不一次 fetchall 全部行
+    nonempty = [s for s in batch_sizes if s > 0]
+    assert nonempty == [10, 10, 3]
+    assert sum(batch_sizes) == 23
+
+    assert task.package_count == 23
+    assert task.first_seq == 1 and task.last_seq == 23
+    assert task.complete is True
+
+    data, *_ = download_all(client, eid)
+    assert [p["seq"] for p in parse_ndjson(data)] == list(range(1, 24))
+    assert hashlib.sha256(data).hexdigest() == task.content_sha256
+
+
+def test_snapshot_streamed_in_seq_batches_bounded(client, monkeypatch):
+    """有界子范围同样按批推进：批间以 seq keyset 续接，不漏不重。"""
+    monkeypatch.setattr(export_mod, "SNAPSHOT_BATCH_SIZE", 4)
+    ingest_range(client, "exp-batch2", 1, 30)
+
+    batch_sizes = []
+    with db_mod.ingest_lock, db_mod.get_conn() as conn:
+        task = export_mod.create_export(
+            _BatchCountingConn(conn, batch_sizes),
+            "exp-batch2", 5, 28,
+        )
+    expect = list(range(5, 29))  # 24 行，恰好 6 个满批
+    assert sum(batch_sizes) == len(expect)
+    assert all(s <= 4 for s in batch_sizes)
+    assert task.package_count == len(expect)
+    assert task.first_seq == 5 and task.last_seq == 28
+
+    data, *_ = download_all(client, task.export_id)
+    assert [p["seq"] for p in parse_ndjson(data)] == expect
+    assert hashlib.sha256(data).hexdigest() == task.content_sha256
+
+
+def test_create_failure_mid_batch_rolls_back_entire_export(client, monkeypatch):
+    """扫描复制途中失败：父表占位行与已写快照行随事务整体回滚。"""
+    ingest_range(client, "exp-rollback", 1, 20)
+
+    real_canonical = export_mod.canonical_line
+    calls = {"n": 0}
+
+    def boom_after_ten(payload_json):
+        calls["n"] += 1
+        if calls["n"] == 11:  # 第二批（批大小调到 10）途中
+            raise RuntimeError("simulated mid-batch failure")
+        return real_canonical(payload_json)
+
+    monkeypatch.setattr(export_mod, "SNAPSHOT_BATCH_SIZE", 10)
+    monkeypatch.setattr(export_mod, "canonical_line", boom_after_ten)
+    # 异常必须穿透 get_conn() 上下文才会触发事务回滚
+    with pytest.raises(RuntimeError, match="simulated mid-batch failure"):
+        with db_mod.ingest_lock, db_mod.get_conn() as conn:
+            export_mod.create_export(conn, "exp-rollback", None, None)
+    monkeypatch.undo()
+
+    # 没有任何任务 / 快照行残留（失败的占位父行也应一并回滚）
+    with db_mod.get_conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM export_tasks WHERE device_id = ?",
+            ("exp-rollback",),
+        ).fetchone()["n"] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM export_items"
+            " WHERE export_id IN ("
+            "     SELECT export_id FROM export_tasks WHERE device_id = ?)",
+            ("exp-rollback",),
+        ).fetchone()["n"] == 0
+        # 业务表不受影响
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM committed WHERE device_id = ?",
+            ("exp-rollback",),
+        ).fetchone()["n"] == 20
+
+    # 设备可重新创建导出，且内容完整正确
+    m = client.post("/api/v1/exports", json={"device_id": "exp-rollback"}).json()
+    assert m["package_count"] == 20 and m["complete"] is True
+    data, *_ = download_all(client, m["export_id"])
+    assert hashlib.sha256(data).hexdigest() == m["content_sha256"]

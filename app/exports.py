@@ -6,6 +6,11 @@
   原样复制进 export_items（只读快照），并计算 manifest。之后即使设备继续
   摄入、排水，导出内容与摘要也完全不变——导出不触碰 committed / buffer /
   duplicates / alert_* 任何业务表。
+- 快照复制按 seq 升序**分批流式**进行：以 keyset（seq > 上批末序号）逐批
+  读取 committed、逐批 executemany 写入 export_items，摘要逐行增量计算、
+  包数与首尾序号逐行累计，任何时刻内存中只保留一批行——即使命中范围（含
+  无界范围）覆盖海量包，创建请求的内存占用也只与批大小有关；任何一步失败
+  由外层事务整体回滚，不会残留半成品任务。
 - 快照行按 seq 升序存储；每个包一行规范化 NDJSON（JSON 键排序 + 行尾
   "\n"，UTF-8），整体 sha256 按行增量计算，与逐页拼接结果一致，
   因此客户端可边下载边自行校验。
@@ -35,6 +40,10 @@ class InvalidCursor(Exception):
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
+
+# 创建快照时每批从 committed 读取 / 写入 export_items 的行数。
+# 流式批处理使创建请求的内存占用只取决于批大小，而与命中包总量无关。
+SNAPSHOT_BATCH_SIZE = 1000
 
 
 @dataclass(frozen=True)
@@ -154,6 +163,12 @@ def create_export(
     """创建一次只读快照导出。调用方需持有 ingest_lock 并保证设备存在。
 
     快照范围为创建时刻 committed 表中 from_seq <= seq <= to_seq 的全部包。
+
+    全程在调用方的同一事务内完成：先插入占位 export_tasks（满足
+    export_items 外键），再按 seq 升序 keyset 分批读取已提交包，逐批写入
+    快照行并逐行累计摘要 / 包数 / 首尾序号，最后回填 manifest 各列。
+    任何一步抛错都由外层事务整体回滚，不留半成品任务。命中范围（含两端
+    无界）再大，内存中也只保留一批行。
     """
     if page_size < 1 or page_size > MAX_PAGE_SIZE:
         raise ExportError(f"page_size 必须在 1..{MAX_PAGE_SIZE} 之间")
@@ -170,24 +185,57 @@ def create_export(
         params.append(to_seq)
     clause = " AND ".join(where)
 
-    rows = conn.execute(
-        f"SELECT seq, payload_json FROM committed WHERE {clause} ORDER BY seq",
-        params,
-    ).fetchall()
-
     export_id = uuid.uuid4().hex
     created_at = _utc_now()
+
+    # 先写父表 export_tasks 占位行（外键约束要求），manifest 统计列扫描
+    # 完成后再回填；中途失败随事务整体回滚，占位行不会残留。
+    conn.execute(
+        """
+        INSERT INTO export_tasks
+            (export_id, device_id, from_seq, to_seq, page_size, package_count,
+             first_seq, last_seq, complete, content_sha256, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            export_id, device_id, from_seq, to_seq, page_size, 0,
+            None, None, 0, hashlib.sha256(b"").hexdigest(), created_at,
+        ),
+    )
+
+    # 分批 keyset 扫描：seq > ? 沿主键序推进，不随总量增长内存占用。
+    # committed 在本事务持锁期间不会被摄入 / 排水修改，各批拼起来即创建
+    # 时刻范围内的完整快照，与一次性 SELECT ... ORDER BY seq 的结果一致。
     digest = hashlib.sha256()
     first_seq: Optional[int] = None
     last_seq: Optional[int] = None
-    items: List[tuple] = []
-    for idx, row in enumerate(rows):
-        chunk = canonical_line(row["payload_json"])
-        digest.update(chunk)
-        if idx == 0:
-            first_seq = row["seq"]
-        last_seq = row["seq"]
-        items.append((export_id, idx, row["seq"], chunk))
+    package_count = 0
+    batch_params = list(params)
+    while True:
+        rows = conn.execute(
+            f"SELECT seq, payload_json FROM committed WHERE {clause}"
+            " AND seq > ? ORDER BY seq LIMIT ?",
+            (*batch_params, last_seq if last_seq is not None else 0,
+             SNAPSHOT_BATCH_SIZE),
+        ).fetchall()
+        if not rows:
+            break
+        items: List[tuple] = []
+        for row in rows:
+            chunk = canonical_line(row["payload_json"])
+            digest.update(chunk)
+            if package_count == 0:
+                first_seq = row["seq"]
+            last_seq = row["seq"]
+            items.append((export_id, package_count, row["seq"], chunk))
+            package_count += 1
+        conn.executemany(
+            "INSERT INTO export_items (export_id, item_index, seq, line)"
+            " VALUES (?,?,?,?)",
+            items,
+        )
+        if len(rows) < SNAPSHOT_BATCH_SIZE:
+            break
 
     # 请求范围是否被已提交数据连续完整覆盖。作废序号不是真实测量包，
     # 因此除"范围与 committed 完全重合且无未排水缓冲"外，还要求范围内
@@ -200,7 +248,7 @@ def create_export(
     want_hi = to_seq if to_seq is not None else committed_upto
     want_lo = from_seq if from_seq is not None else first_seq
     buffered_beyond = 0
-    if to_seq is None and len(rows) > 0:
+    if to_seq is None and package_count > 0:
         buffered_beyond = conn.execute(
             "SELECT COUNT(*) AS n FROM buffer WHERE device_id = ? AND seq > ?",
             (device_id, committed_upto),
@@ -213,7 +261,7 @@ def create_export(
         else False
     )
     complete = (
-        len(rows) > 0
+        package_count > 0
         and want_lo is not None
         and want_lo == first_seq
         and want_hi == last_seq
@@ -221,24 +269,18 @@ def create_export(
         and not void_in_range
     )
 
-    # 先写父表 export_tasks，再写快照行（外键约束）
+    # 回填 manifest 统计列；至此快照行与摘要均已落库（仍在同一事务内）
     conn.execute(
         """
-        INSERT INTO export_tasks
-            (export_id, device_id, from_seq, to_seq, page_size, package_count,
-             first_seq, last_seq, complete, content_sha256, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        UPDATE export_tasks
+           SET package_count = ?, first_seq = ?, last_seq = ?,
+               complete = ?, content_sha256 = ?
+         WHERE export_id = ?
         """,
         (
-            export_id, device_id, from_seq, to_seq, page_size, len(rows),
-            first_seq, last_seq, 1 if complete else 0,
-            digest.hexdigest(), created_at,
+            package_count, first_seq, last_seq, 1 if complete else 0,
+            digest.hexdigest(), export_id,
         ),
-    )
-    conn.executemany(
-        "INSERT INTO export_items (export_id, item_index, seq, line)"
-        " VALUES (?,?,?,?)",
-        items,
     )
     task = get_task(conn, export_id)
     assert task is not None
