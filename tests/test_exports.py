@@ -321,3 +321,59 @@ def test_invalid_range_and_page_size(client):
         "/api/v1/exports", json={"device_id": "exp-i", "page_size": 1001}
     )
     assert r.status_code == 422
+
+
+def test_batched_snapshot_creation_matches_manifest(client, monkeypatch):
+    """批大小调小后跨多批创建：manifest、分页字节与摘要与单批完全一致。"""
+    monkeypatch.setattr(export_mod, "_SNAPSHOT_BATCH_SIZE", 2)
+    ingest_range(client, "exp-j", 1, 7)
+    m = client.post(
+        "/api/v1/exports", json={"device_id": "exp-j", "page_size": 3}
+    ).json()
+    assert m["package_count"] == 7
+    assert m["first_seq"] == 1 and m["last_seq"] == 7
+    assert m["complete"] is True
+
+    data, pages, offsets, done_flags = download_all(client, m["export_id"])
+    assert offsets == [0, 3, 6]
+    assert done_flags == ["false", "false", "true"]
+    assert [p["seq"] for p in parse_ndjson(data)] == [1, 2, 3, 4, 5, 6, 7]
+    assert hashlib.sha256(data).hexdigest() == m["content_sha256"]
+
+
+def test_create_export_rolls_back_on_failure(client, monkeypatch):
+    """创建中途失败：已写入的占位任务行与部分快照行随事务整体回滚。"""
+    from app import db
+
+    monkeypatch.setattr(export_mod, "_SNAPSHOT_BATCH_SIZE", 2)
+    ingest_range(client, "exp-rb", 1, 10)
+
+    real_canonical_line = export_mod.canonical_line
+    calls = {"n": 0}
+
+    def boom(payload_json):
+        calls["n"] += 1
+        if calls["n"] == 5:  # 前两批（4 行）已写入 export_items 后失败
+            raise RuntimeError("boom")
+        return real_canonical_line(payload_json)
+
+    monkeypatch.setattr(export_mod, "canonical_line", boom)
+    with pytest.raises(RuntimeError):
+        client.post("/api/v1/exports", json={"device_id": "exp-rb"})
+
+    # 整次创建回滚：该设备不留下任何任务行或快照行
+    with db.get_conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM export_tasks WHERE device_id = 'exp-rb'"
+        ).fetchone()["n"] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM export_items ei"
+            " JOIN export_tasks et ON ei.export_id = et.export_id"
+            " WHERE et.device_id = 'exp-rb'"
+        ).fetchone()["n"] == 0
+
+    # 失败后可正常重试，结果与未失败时一致
+    m = client.post("/api/v1/exports", json={"device_id": "exp-rb"}).json()
+    assert m["package_count"] == 10 and m["complete"] is True
+    data, *_ = download_all(client, m["export_id"])
+    assert hashlib.sha256(data).hexdigest() == m["content_sha256"]
